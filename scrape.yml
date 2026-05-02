@@ -1,0 +1,125 @@
+name: Collin County Lead Scraper
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 8 AM UTC daily (3 AM Dallas CDT) — 1hr after DCAD
+  workflow_dispatch:        # allow manual trigger
+
+permissions:
+  contents: write
+  pages:    write
+  id-token: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Python setup ──────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+
+      # ── 3. Install Python dependencies ──────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml playwright pdfplumber
+
+      # ── 4. Install Playwright browsers ──────────────────────────────────
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      # ── 5. Run lead scraper ──────────────────────────────────────────────
+      - name: Run Collin County scraper
+        id: scraper
+        run: |
+          python scraper/fetch.py 2>&1 | tee /tmp/scraper_output.txt
+          if grep -q "cookie expired" /tmp/scraper_output.txt; then
+            echo "cookie_expired=true" >> $GITHUB_OUTPUT
+          else
+            echo "cookie_expired=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          PYTHONUNBUFFERED:   "1"
+          RESEARCH_TX_COOKIE: ${{ secrets.RESEARCH_TX_COOKIE }}
+
+      # ── 6. Export parcel data by zip code ────────────────────────────────
+      - name: Export CCAD parcel data
+        run: python scraper/export_parcels.py
+        env:
+          PYTHONUNBUFFERED: "1"
+
+      # ── 7. Email alert if cookie expired ────────────────────────────────
+      - name: Send cookie expiry alert
+        if: steps.scraper.outputs.cookie_expired == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port:    465
+          secure:         true
+          username:       ${{ secrets.ALERT_EMAIL_ADDRESS }}
+          password:       ${{ secrets.ALERT_EMAIL_PASSWORD }}
+          to:             ${{ secrets.ALERT_EMAIL_ADDRESS }}
+          from:           Collin County Scraper <${{ secrets.ALERT_EMAIL_ADDRESS }}>
+          subject:        "⚠️ Action Required: re:SearchTX Cookie Expired (Collin County)"
+          body: |
+            Your Collin County lead scraper ran today but the re:SearchTX
+            cookie has expired — probate records will be missing until you
+            update it.
+
+            To fix:
+            1. Go to https://research.txcourts.gov and log in
+            2. Open DevTools (F12) → Network tab → run any search
+            3. Click the search request → Headers → copy the Cookie value
+            4. Go to your GitHub repo → Settings → Secrets → Actions
+            5. Update the RESEARCH_TX_COOKIE secret with the new value
+
+            Note: This same cookie is shared with your Dallas County scraper.
+
+      # ── 8. Commit updated files ──────────────────────────────────────────
+      - name: Commit updated records
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dashboard/records.json data/records.json data/ghl_export_*.csv data/parcel_export_*.csv data/longterm_owners_*.csv data/ccad_address_lookup.json || true
+          git diff --cached --quiet || git commit -m "chore: update Collin County records $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Deploy dashboard to GitHub Pages ─────────────────────────────────────
+  deploy-pages:
+    needs: scrape
+    runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload dashboard artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dashboard/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
