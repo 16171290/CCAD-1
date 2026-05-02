@@ -1,1 +1,1 @@
-Account Number,Owner Name,Property Street Number,Property Street,Property City,Property Zip,Mailing Address,Mailing City,Mailing State,Mailing Zip,Year Built,Living Area SqFt,Bedrooms,Bathrooms,Deed Transfer Date,Appraised Value,Property Type,Property Address
+geoID,propType,propSubType,ownerName,ownerName2,situsConcat,siusStreetNumber,streetName,City,Zip,mailingAddress,mailingCity,mailingSt,mailingZip,imprvYearBuilt,imprvMainArea,deedDate,deedFileDate,prevValMarket,prevValAppraised,longTermOwner
