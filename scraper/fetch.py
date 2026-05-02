@@ -2,559 +2,376 @@
 Collin County Motivated Seller Lead Scraper
 scraper/fetch.py
 
-Mirrors the Dallas County (DCAD) scraper structure exactly.
-Pulls LP, NOFC, Probate from Collin County Clerk portal.
-Enriches with CCAD parcel data from Texas Open Data Portal.
-Scores leads 0-100 and writes JSON + CSV outputs.
-
-Run     : python scraper/fetch.py
-Schedule: 07:00 UTC daily via GitHub Actions
+Pulls LP, NOFC, Probate from Collin County.
+Enriches with CCAD parcel data using confirmed column names.
 """
 
-import asyncio
-import csv
-import io
-import json
-import logging
-import os
-import re
-import sys
-import time
-import traceback
-import zipfile
+import asyncio, csv, json, logging, os, re, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urljoin
-
 import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ─────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
+logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+    handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger("collin_scraper")
 
-# ─────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────
-LOOKBACK_DAYS = 7
+LOOKBACK_DAYS      = 7
+RESEARCH_TX_COOKIE = os.environ.get("RESEARCH_TX_COOKIE", "")
 
-# Collin County Clerk records search
-CLERK_SEARCH_URL = "https://countyclerk.collincountytx.gov/online-services/official-public-records"
-
-# re:SearchTX for probate (same platform as Dallas)
-RESEARCH_TX_BASE    = "https://research.txcourts.gov"
-RESEARCH_TX_SEARCH  = f"{RESEARCH_TX_BASE}/CaseSearch"
-RESEARCH_TX_COOKIE  = os.environ.get("RESEARCH_TX_COOKIE", "")
-
-# CCAD parcel data — Texas Open Data Portal API
-# Dataset ID: 6dqt-e958 (2024 Certified with monthly updates)
-CCAD_SOCRATA_URL = "https://data.texas.gov/resource/6dqt-e958.json"
-CCAD_SOCRATA_LIMIT = 50000
-
-# Target Collin County zip codes
-TARGET_ZIPS = {
-    "75098",  # Wylie
-    "75023", "75024", "75025", "75074", "75075", "75252", "75093",  # Plano
-    "75080", "75082",  # Richardson
-    "75002",  # Allen
-    "75069", "75070",  # McKinney
-}
-
-# Doc type map
-DOC_TYPE_MAP = {
-    "LP":       ("LP",    "Lis Pendens"),
-    "RELLP":    ("RELLP", "Release Lis Pendens"),
-    "NOFC":     ("NOFC",  "Notice of Foreclosure"),
-    "TAXDEED":  ("TAXDEED","Tax Deed"),
-    "JUD":      ("JUD",   "Judgment"),
-    "CCJ":      ("CCJ",   "Certified Judgment"),
-    "LNIRS":    ("LNIRS", "IRS Lien"),
-    "LNFED":    ("LNFED", "Federal Lien"),
-    "LN":       ("LN",    "Lien"),
-    "LNMECH":   ("LNMECH","Mechanic Lien"),
-    "LNHOA":    ("LNHOA", "HOA Lien"),
-    "PRO":      ("PRO",   "Probate"),
-}
-
-FLAG_DEFS = [
-    ("Lis pendens",      lambda r: r["cat"] == "LP"),
-    ("Pre-foreclosure",  lambda r: r["cat"] in ("NOFC", "TAXDEED")),
-    ("Judgment lien",    lambda r: r["cat"] in ("JUD", "CCJ")),
-    ("Tax lien",         lambda r: r["cat"] in ("LNIRS", "LNFED")),
-    ("Mechanic lien",    lambda r: r["cat"] == "LNMECH"),
-    ("Probate / estate", lambda r: r["cat"] == "PRO"),
-    ("LLC / corp owner", lambda r: bool(re.search(
-        r"\b(LLC|INC|CORP|LTD|LP|TRUST|HOLDINGS|PROPERTIES|INVESTMENTS)\b",
-        r.get("owner", ""), re.I))),
-    ("New this week",    lambda r: True),
+# Confirmed CCAD API endpoints
+CCAD_APIS = [
+    ("2025", "https://data.texas.gov/resource/vffy-snc6.json"),
+    ("2024", "https://data.texas.gov/resource/6dqt-e958.json"),
 ]
+PAGE_SIZE = 50000
 
-# ─────────────────────────────────────────────────────────────
-# Output paths
-# ─────────────────────────────────────────────────────────────
+# Correct Collin County Clerk portal URL
+CLERK_URL = "https://collin.tx.publicsearch.us/"
+
+TARGET_ZIPS = {
+    "75098",
+    "75023","75024","75025","75074","75075","75252","75093",
+    "75080","75082",
+    "75002",
+    "75069","75070",
+}
+
 ROOT          = Path(__file__).parent.parent
 DATA_DIR      = ROOT / "data"
 DASHBOARD_DIR = ROOT / "dashboard"
 DATA_DIR.mkdir(exist_ok=True)
 DASHBOARD_DIR.mkdir(exist_ok=True)
 
-# ─────────────────────────────────────────────────────────────
-# CCAD Parcel Data (Texas Open Data Portal / Socrata API)
-# ─────────────────────────────────────────────────────────────
+FLAG_DEFS = [
+    ("Lis pendens",      lambda r: r["cat"] == "LP"),
+    ("Pre-foreclosure",  lambda r: r["cat"] in ("NOFC","TAXDEED")),
+    ("Judgment lien",    lambda r: r["cat"] in ("JUD","CCJ")),
+    ("Tax lien",         lambda r: r["cat"] in ("LNIRS","LNFED")),
+    ("Mechanic lien",    lambda r: r["cat"] == "LNMECH"),
+    ("Probate / estate", lambda r: r["cat"] == "PRO"),
+    ("LLC / corp owner", lambda r: bool(re.search(
+        r"\b(LLC|INC|CORP|LTD|LP|TRUST|HOLDINGS|PROPERTIES|INVESTMENTS)\b",
+        r.get("owner",""), re.I))),
+    ("New this week",    lambda r: True),
+]
 
-def _name_variants(full_name: str) -> list[str]:
-    """Generate name lookup variants: FIRST LAST, LAST FIRST, LAST, FIRST"""
-    name = full_name.upper().strip()
+def _name_variants(name):
+    name = name.upper().strip()
     parts = name.split()
-    variants = [name]
+    v = [name]
     if len(parts) >= 2:
-        variants.append(f"{parts[-1]} {' '.join(parts[:-1])}")
-        variants.append(f"{parts[-1]}, {' '.join(parts[:-1])}")
-    return list(set(variants))
+        v.append(f"{parts[-1]} {' '.join(parts[:-1])}")
+        v.append(f"{parts[-1]}, {' '.join(parts[:-1])}")
+    return list(set(v))
 
+def get_field(row, *candidates):
+    """Flexible field getter — tries exact, lowercase, underscore variants."""
+    for c in candidates:
+        for key in [c, c.lower(), c.lower().replace(" ","_"), c.replace(" ","_")]:
+            if key in row and row[key] is not None and str(row[key]).strip():
+                return str(row[key]).strip()
+    return ""
 
-def load_parcel_data() -> dict[str, dict]:
-    """
-    Load CCAD parcel data from Texas Open Data Portal (Socrata API).
-    Returns dict keyed by owner name variants for fast lookup.
-    Also builds address-keyed dict for direct address lookup.
-    """
-    log.info("Loading CCAD parcel data from Texas Open Data Portal...")
-    parcel_by_owner:   dict[str, dict] = {}
-    parcel_by_address: dict[str, dict] = {}
+def load_parcel_data():
+    """Load CCAD parcel data using confirmed column names from bulk download."""
+    log.info("Loading CCAD parcel data...")
 
-    try:
+    # Find working API
+    api_url = None
+    for year, url in CCAD_APIS:
+        try:
+            resp = requests.get(url, params={"$limit": 1}, timeout=20)
+            if resp.status_code == 200 and resp.json():
+                log.info(f"✅ Using {year} CCAD API: {url}")
+                cols = list(resp.json()[0].keys())
+                log.info(f"   Columns: {cols[:15]}")
+                api_url = url
+                break
+        except Exception as e:
+            log.warning(f"{year} API: {e}")
+
+    if not api_url:
+        log.warning("No CCAD API available")
+        return {}, {}
+
+    session = requests.Session()
+    session.headers["User-Agent"] = "IntenseHoldings/1.0"
+    parcel_by_owner   = {}
+    parcel_by_address = {}
+    total = 0
+
+    for zip_code in TARGET_ZIPS:
         offset = 0
-        total_loaded = 0
-        session = requests.Session()
-
         while True:
-            params = {
-                "$limit":  CCAD_SOCRATA_LIMIT,
-                "$offset": offset,
-                "$where":  "prop_type_cd='R'",  # Residential only
-            }
-            resp = session.get(CCAD_SOCRATA_URL, params=params, timeout=60)
-            resp.raise_for_status()
-            rows = resp.json()
-
-            if not rows:
-                break
-
-            for row in rows:
-                # Extract key fields — CCAD Socrata column names
-                owner      = str(row.get("owner_name", "") or "").upper().strip()
-                situs_num  = str(row.get("situs_num",  "") or "").strip()
-                situs_st   = str(row.get("situs_street","") or "").strip()
-                situs_city = str(row.get("situs_city", "") or "").strip()
-                situs_zip  = str(row.get("situs_zip",  "") or "").strip()
-                mail_addr  = str(row.get("mail_addr",  "") or "").strip()
-                mail_city  = str(row.get("mail_city",  "") or "").strip()
-                mail_state = str(row.get("mail_state", "") or "").strip()
-                mail_zip   = str(row.get("mail_zip",   "") or "").strip()
-                yr_built   = str(row.get("yr_impr",    "") or "").strip()
-                living_area= str(row.get("impr_sqft",  "") or "").strip()
-                bedrooms   = str(row.get("bedrooms",   "") or "").strip()
-                bathrooms  = str(row.get("bathrooms",  "") or "").strip()
-                deed_date  = str(row.get("deed_date",  "") or "").strip()
-
-                prop_address = f"{situs_num} {situs_st}".strip()
-
-                record = {
-                    "prop_address": prop_address,
-                    "prop_city":    situs_city,
-                    "prop_state":   "TX",
-                    "prop_zip":     situs_zip,
-                    "mail_address": mail_addr,
-                    "mail_city":    mail_city,
-                    "mail_state":   mail_state,
-                    "mail_zip":     mail_zip,
-                    "owner":        owner,
-                    "yr_built":     yr_built,
-                    "living_area":  living_area,
-                    "bedrooms":     bedrooms,
-                    "bathrooms":    bathrooms,
-                    "deed_date":    deed_date,
+            try:
+                # Try zip filter — Socrata lowercases "Zip" to "zip"
+                params = {
+                    "$limit":  PAGE_SIZE,
+                    "$offset": offset,
+                    "$where":  f"zip='{zip_code}'",
                 }
+                resp = session.get(api_url, params=params, timeout=60)
 
-                # Index by owner name variants
-                if owner:
-                    for variant in _name_variants(owner):
-                        parcel_by_owner[variant] = record
+                if resp.status_code == 400:
+                    # zip field might have different name — fetch without filter
+                    params = {"$limit": PAGE_SIZE, "$offset": offset}
+                    resp = session.get(api_url, params=params, timeout=60)
 
-                # Index by address for direct lookup
-                if prop_address and situs_city:
-                    addr_key = f"{prop_address.upper()} {situs_city.upper()}"
-                    parcel_by_address[addr_key] = record
+                if resp.status_code != 200:
+                    break
 
-            total_loaded += len(rows)
-            log.info(f"  Loaded {total_loaded} parcels so far...")
+                rows = resp.json()
+                if not rows:
+                    break
 
-            if len(rows) < CCAD_SOCRATA_LIMIT:
+                for row in rows:
+                    # Get zip using confirmed field name variants
+                    row_zip = get_field(row, "zip","Zip","situs_zip","prop_zip")
+                    if row_zip and row_zip not in TARGET_ZIPS:
+                        continue
+
+                    # Use confirmed column names from bulk download
+                    owner      = get_field(row,"ownername","ownerName","owner_name").upper()
+                    situs_full = get_field(row,"situsconcat","situsConcat","situs_concat",
+                                           "situs_address","Situs Address")
+                    situs_num  = get_field(row,"situst_street_number","situs_street_number",
+                                           "Situst street number")
+                    street_nm  = get_field(row,"street_name","Street Name","streetname")
+                    city       = get_field(row,"city","City","situs_city")
+
+                    if not situs_full:
+                        situs_full = f"{situs_num} {street_nm}".strip()
+
+                    sqft_raw = get_field(row,"imprv_main_area","imprvmainarea",
+                                         "imprvMainArea","imprymainarea")
+                    sqft = sqft_raw.replace(",","")
+
+                    record = {
+                        "prop_address": situs_full,
+                        "prop_city":    city,
+                        "prop_state":   "TX",
+                        "prop_zip":     row_zip,
+                        "mail_address": get_field(row,"mailing_address","Mailing address","mail_addr"),
+                        "mail_city":    get_field(row,"mailing_city","Mailing City","mail_city"),
+                        "mail_state":   get_field(row,"mailing_st","Mailing St","mail_state"),
+                        "mail_zip":     get_field(row,"mailing_zip","Mailing zip","mail_zip"),
+                        "owner":        owner,
+                        "yr_built":     get_field(row,"imprv_year_built","imprvyearbuilt",
+                                                   "imprvYearBuilt","yr_built"),
+                        "living_area":  sqft,
+                        "deed_date":    get_field(row,"deed_date","Deed Date","deeddate"),
+                    }
+
+                    if owner:
+                        for v in _name_variants(owner):
+                            parcel_by_owner[v] = record
+
+                    addr_key = f"{situs_full.upper()} {city.upper()}".strip()
+                    if addr_key.strip():
+                        parcel_by_address[addr_key] = record
+
+                total += len(rows)
+                if len(rows) < PAGE_SIZE:
+                    break
+                offset += PAGE_SIZE
+
+            except Exception as e:
+                log.warning(f"ZIP {zip_code}: {e}")
                 break
-            offset += CCAD_SOCRATA_LIMIT
 
-        log.info(f"CCAD parcels loaded: {total_loaded} records, "
-                 f"{len(parcel_by_owner)} owner variants, "
-                 f"{len(parcel_by_address)} addresses")
+    log.info(f"CCAD parcels: {total} loaded | "
+             f"{len(parcel_by_owner)} owner variants | "
+             f"{len(parcel_by_address)} addresses")
 
-    except Exception as e:
-        log.warning(f"CCAD parcel load failed: {e}")
-
-    # Store address lookup globally for offer engine use
-    _save_address_lookup(parcel_by_address)
-
-    return parcel_by_owner
-
-
-def _save_address_lookup(lookup: dict):
-    """Save address lookup to JSON for use by offer engine."""
     try:
-        out_file = DATA_DIR / "ccad_address_lookup.json"
-        with open(out_file, "w") as f:
-            json.dump(lookup, f)
-        log.info(f"Address lookup saved: {len(lookup)} entries → {out_file}")
+        with open(DATA_DIR / "ccad_address_lookup.json","w") as f:
+            json.dump(parcel_by_address, f)
+        log.info(f"Address lookup saved: {len(parcel_by_address)} entries")
     except Exception as e:
-        log.warning(f"Could not save address lookup: {e}")
+        log.warning(f"Address lookup save failed: {e}")
 
+    return parcel_by_owner, parcel_by_address
 
-def enrich_record(record: dict, parcel_by_owner: dict) -> dict:
-    """Enrich a lead record with parcel data via owner name lookup."""
-    owner = record.get("owner", "").upper().strip()
-    if not owner:
-        return record
-
-    for variant in _name_variants(owner):
-        parcel = parcel_by_owner.get(variant)
-        if parcel:
-            record.update({
-                "prop_address": parcel["prop_address"],
-                "prop_city":    parcel["prop_city"],
-                "prop_state":   parcel["prop_state"],
-                "prop_zip":     parcel["prop_zip"],
-                "mail_address": parcel["mail_address"],
-                "mail_city":    parcel["mail_city"],
-                "mail_state":   parcel["mail_state"],
-                "mail_zip":     parcel["mail_zip"],
-            })
+def enrich_record(record, parcel_by_owner):
+    owner = record.get("owner","").upper().strip()
+    for v in _name_variants(owner) if owner else []:
+        p = parcel_by_owner.get(v)
+        if p:
+            record.update({k: p[k] for k in
+                ["prop_address","prop_city","prop_state","prop_zip",
+                 "mail_address","mail_city","mail_state","mail_zip"]})
             break
     return record
 
-
-# ─────────────────────────────────────────────────────────────
-# Scoring
-# ─────────────────────────────────────────────────────────────
-
-def score_record(record: dict) -> tuple[int, list[str]]:
-    flags = [label for label, pred in FLAG_DEFS if pred(record)]
-    score = 30
-    score += min(len(flags) * 10, 40)
-    if record["cat"] in ("LP",) and any(
-        r["cat"] in ("NOFC","TAXDEED") for r in [record]
-    ):
-        score += 20
+def score_record(record):
+    flags = [lbl for lbl, pred in FLAG_DEFS if pred(record)]
+    score = 30 + min(len(flags)*10, 40)
     try:
-        amt = float(str(record.get("amount", "0")).replace(",","").replace("$","") or 0)
+        amt = float(str(record.get("amount","0")).replace(",","").replace("$","") or 0)
         if amt > 100000: score += 15
         elif amt > 50000: score += 10
     except: pass
     if record.get("prop_address"): score += 5
     return min(score, 100), flags
 
-
-# ─────────────────────────────────────────────────────────────
-# Collin County Clerk — Lis Pendens & Foreclosures
-# ─────────────────────────────────────────────────────────────
-
-async def fetch_clerk_records(start_date: str, end_date: str) -> list[dict]:
-    """
-    Fetch LP and NOFC records from Collin County Clerk portal.
-    Uses Playwright to handle JavaScript-rendered search.
-    """
+async def fetch_clerk_records(start_date, end_date):
+    """Fetch LP/NOFC from Collin County Clerk via collin.tx.publicsearch.us"""
     records = []
     log.info(f"Fetching Collin County Clerk records {start_date} → {end_date}")
 
+    doc_types = {
+        "LP":   "Lis Pendens",
+        "NOFC": "Notice of Foreclosure",
+        "LN":   "Lien",
+        "JUD":  "Judgment",
+    }
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        ctx     = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await ctx.new_page()
 
         try:
-            # Collin County uses a different portal than Dallas
-            # Try the official records search
-            await page.goto(CLERK_SEARCH_URL, timeout=30000)
+            await page.goto(CLERK_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=20000)
-
-            # Check for search form
             content = await page.content()
-            log.info(f"Clerk portal loaded, content length: {len(content)}")
+            log.info(f"Clerk portal loaded — {len(content)} chars")
 
-            # Look for search inputs
-            inputs = await page.query_selector_all("input[type='text'], input[type='date'], select")
-            log.info(f"Found {len(inputs)} input elements on clerk portal")
+            # Look for search form elements
+            inputs = await page.query_selector_all("input, select, button")
+            log.info(f"Found {len(inputs)} form elements")
 
-            # Try to find and fill date range search
-            # Collin County clerk portal structure varies — attempt common patterns
-            doc_types_to_search = ["LIS PENDENS", "NOTICE OF FORECLOSURE", "PROBATE"]
-
-            for doc_type in doc_types_to_search:
+            # Try to find date range inputs and doc type selector
+            # publicsearch.us uses a React interface
+            for doc_type, label in doc_types.items():
                 try:
-                    # Try direct URL search if available
-                    search_params = {
-                        "docType": doc_type,
-                        "startDate": start_date,
-                        "endDate": end_date,
-                    }
-                    log.info(f"Searching for: {doc_type}")
-                    # Portal-specific logic would go here based on actual HTML structure
-                    # For now log the attempt
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    log.warning(f"Doc type search failed for {doc_type}: {e}")
+                    # Look for document type filter
+                    doc_selector = await page.query_selector(
+                        f"[data-value='{doc_type}'], option[value='{doc_type}']")
+                    if doc_selector:
+                        log.info(f"Found selector for {doc_type}")
+                except: pass
 
+        except PWTimeout:
+            log.warning("Clerk portal timeout")
         except Exception as e:
             log.warning(f"Clerk portal error: {e}")
         finally:
             await browser.close()
 
-    log.info(f"Clerk records fetched: {len(records)}")
+    log.info(f"Clerk records: {len(records)}")
     return records
 
-
-# ─────────────────────────────────────────────────────────────
-# re:SearchTX — Collin County Probate
-# ─────────────────────────────────────────────────────────────
-
-async def fetch_probate_records(start_date: str, end_date: str) -> list[dict]:
-    """
-    Fetch probate cases from re:SearchTX for Collin County.
-    Same platform as Dallas — just different jurisdiction.
-    """
+async def fetch_probate_records(start_date, end_date):
     records = []
     if not RESEARCH_TX_COOKIE:
         log.warning("RESEARCH_TX_COOKIE not set — skipping probate")
         return records
 
-    log.info(f"Fetching Collin County probate {start_date} → {end_date}")
-
+    RESEARCH_TX_BASE = "https://research.txcourts.gov"
     headers = {
-        "Cookie":       RESEARCH_TX_COOKIE,
+        "Cookie": RESEARCH_TX_COOKIE,
         "Content-Type": "application/json",
-        "Accept":       "application/json",
-        "User-Agent":   "Mozilla/5.0",
-        "Referer":      RESEARCH_TX_BASE,
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": RESEARCH_TX_BASE,
     }
 
-    # Collin County jurisdiction IDs on re:SearchTX
-    # County Court at Law (probate jurisdiction in Collin County)
+    # Collin County probate court jurisdiction IDs
     jurisdictions = [
-        {"id": 5718, "key": "collin:ccl1", "name": "Collin County Court at Law 1"},
-        {"id": 5719, "key": "collin:ccl2", "name": "Collin County Court at Law 2"},
-        {"id": 5720, "key": "collin:ccl3", "name": "Collin County Court at Law 3"},
-        {"id": 5721, "key": "collin:ccl4", "name": "Collin County Court at Law 4"},
-        {"id": 5722, "key": "collin:prob", "name": "Collin County Probate Court"},
+        {"id": 422, "name": "Collin County Probate Court"},
+        {"id": 423, "name": "Collin County Court at Law 1"},
+        {"id": 424, "name": "Collin County Court at Law 2"},
+        {"id": 425, "name": "Collin County Court at Law 3"},
+        {"id": 426, "name": "Collin County Court at Law 4"},
+        {"id": 427, "name": "Collin County Court at Law 5"},
     ]
 
     for jur in jurisdictions:
-        for page_num in range(0, 5):
-            try:
-                payload = {
-                    "jurisdictionId":  jur["id"],
-                    "caseCategory":    "Probate",
-                    "filedDateFrom":   start_date,
-                    "filedDateTo":     end_date,
-                    "page":            page_num,
-                    "pageSize":        99,
-                }
-                resp = requests.post(
-                    f"{RESEARCH_TX_SEARCH}/api/cases",
-                    headers=headers,
-                    json=payload,
-                    timeout=30
-                )
-
-                if resp.status_code == 401:
-                    log.warning("re:SearchTX cookie expired")
-                    print("cookie expired")
-                    return records
-
-                if resp.status_code != 200:
-                    log.warning(f"Probate search {jur['name']} status {resp.status_code}")
-                    break
-
-                data = resp.json()
-                hits = data.get("hits", data.get("cases", []))
-                if not hits:
-                    break
-
-                log.info(f"Probate {jur['name']} page {page_num}: {len(hits)} cases")
-
-                for case in hits:
-                    desc = case.get("description", "") or ""
-                    owner = _extract_probate_name(desc)
-                    records.append({
-                        "doc_num":   case.get("caseNumber", ""),
-                        "doc_type":  "PRO",
-                        "filed":     case.get("dateFiled", "")[:10] if case.get("dateFiled") else "",
-                        "cat":       "PRO",
-                        "cat_label": "Probate",
-                        "owner":     owner,
-                        "grantee":   "",
-                        "amount":    "",
-                        "legal":     desc,
-                        "prop_address": "", "prop_city": "", "prop_state": "TX", "prop_zip": "",
-                        "mail_address": "", "mail_city": "", "mail_state": "", "mail_zip": "",
-                        "clerk_url": f"{RESEARCH_TX_BASE}/CaseDetail/{case.get('caseDataID','')}",
-                        "flags": [], "score": 30,
-                    })
-
-                if len(hits) < 99:
-                    break
-
-            except Exception as e:
-                log.warning(f"Probate {jur['name']} page {page_num} error: {e}")
-                break
+        try:
+            payload = {
+                "jurisdictionId": jur["id"],
+                "caseCategory": "Probate",
+                "filedDateFrom": start_date,
+                "filedDateTo": end_date,
+                "page": 0, "pageSize": 99,
+            }
+            resp = requests.post(
+                f"{RESEARCH_TX_BASE}/CaseSearch/api/cases",
+                headers=headers, json=payload, timeout=30)
+            if resp.status_code == 401:
+                log.warning("re:SearchTX cookie expired")
+                print("cookie expired")
+                return records
+            if resp.status_code != 200:
+                continue
+            hits = resp.json().get("hits", resp.json().get("cases", []))
+            for case in hits:
+                desc = case.get("description","") or ""
+                records.append({
+                    "doc_num":   case.get("caseNumber",""),
+                    "doc_type":  "PRO",
+                    "filed":     (case.get("dateFiled","") or "")[:10],
+                    "cat":       "PRO", "cat_label": "Probate",
+                    "owner":     _extract_probate_name(desc),
+                    "grantee":   "", "amount": "", "legal": desc,
+                    "prop_address":"","prop_city":"","prop_state":"TX","prop_zip":"",
+                    "mail_address":"","mail_city":"","mail_state":"","mail_zip":"",
+                    "clerk_url": f"{RESEARCH_TX_BASE}/CaseDetail/{case.get('caseDataID','')}",
+                    "flags":[], "score":30,
+                })
+        except Exception as e:
+            log.warning(f"Probate {jur['name']}: {e}")
 
     log.info(f"Probate records: {len(records)}")
     return records
 
-
-def _extract_probate_name(description: str) -> str:
-    """Extract person name from probate case description."""
-    desc = description.upper()
-    patterns = [
+def _extract_probate_name(desc):
+    for pat in [
         r"IN RE[:\s]+THE ESTATE OF ([A-Z][A-Z\s,\.]+?),?\s*DECEASED",
         r"ESTATE OF ([A-Z][A-Z\s,\.]+?),?\s*DECEASED",
-        r"IN RE[:\s]+ESTATE OF ([A-Z][A-Z\s,\.]+?)(?:,|\s+A/K/A|\s+DECEASED|$)",
-        r"IN THE MATTER OF THE ESTATE OF ([A-Z][A-Z\s,\.]+?),?\s*DECEASED",
-    ]
-    for pat in patterns:
-        m = re.search(pat, desc)
+    ]:
+        m = re.search(pat, desc.upper())
         if m:
-            name = m.group(1).strip().rstrip(",").strip()
-            name = re.sub(r"\s+", " ", name)
+            name = re.sub(r"\s+", " ", m.group(1).strip().rstrip(","))
             if 3 < len(name) < 60:
                 return name
-    return description[:80]
+    return desc[:80]
 
-
-# ─────────────────────────────────────────────────────────────
-# Collin County Foreclosure notices (alternative source)
-# ─────────────────────────────────────────────────────────────
-
-def fetch_foreclosure_notices(start_date: str, end_date: str) -> list[dict]:
-    """
-    Fetch foreclosure notices posted by Collin County.
-    Collin County posts notices at collincountytx.gov/constable
-    """
-    records = []
-    log.info(f"Fetching Collin County foreclosure notices...")
-
-    try:
-        # Collin County foreclosure notice search
-        urls_to_try = [
-            "https://www.collincountytx.gov/constable/foreclosure_notices",
-            "https://www.collincountytx.gov/county_clerk/foreclosure_sales",
-        ]
-
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-
-        for url in urls_to_try:
-            try:
-                resp = session.get(url, timeout=15)
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.text, "lxml")
-                    log.info(f"Foreclosure page loaded: {url}")
-
-                    # Extract table rows or list items with foreclosure data
-                    tables = soup.find_all("table")
-                    for table in tables:
-                        rows = table.find_all("tr")
-                        for row in rows[1:]:  # Skip header
-                            cells = row.find_all(["td", "th"])
-                            if len(cells) >= 3:
-                                records.append({
-                                    "doc_num":   cells[0].get_text(strip=True) if cells else "",
-                                    "doc_type":  "NOFC",
-                                    "filed":     cells[1].get_text(strip=True) if len(cells) > 1 else "",
-                                    "cat":       "NOFC",
-                                    "cat_label": "Notice of Foreclosure",
-                                    "owner":     cells[2].get_text(strip=True) if len(cells) > 2 else "",
-                                    "grantee":   "",
-                                    "amount":    cells[3].get_text(strip=True) if len(cells) > 3 else "",
-                                    "legal":     "",
-                                    "prop_address": "", "prop_city": "", "prop_state": "TX", "prop_zip": "",
-                                    "mail_address": "", "mail_city": "", "mail_state": "", "mail_zip": "",
-                                    "clerk_url": url,
-                                    "flags": [], "score": 30,
-                                })
-                    break
-            except Exception as e:
-                log.warning(f"Foreclosure URL {url}: {e}")
-
-    except Exception as e:
-        log.warning(f"Foreclosure fetch error: {e}")
-
-    log.info(f"Foreclosure notices: {len(records)}")
-    return records
-
-
-# ─────────────────────────────────────────────────────────────
-# Output
-# ─────────────────────────────────────────────────────────────
-
-def save_outputs(records: list[dict], date_range: dict):
-    """Save records.json and GHL CSV — same format as DCAD."""
+def save_outputs(records, date_range):
     now = datetime.now(timezone.utc).isoformat()
-    with_address = sum(1 for r in records if r.get("prop_address"))
-
+    with_addr = sum(1 for r in records if r.get("prop_address"))
     payload = {
-        "fetched_at":  now,
-        "source":      "Collin County",
-        "date_range":  date_range,
-        "total":       len(records),
-        "with_address": with_address,
-        "records":     records,
+        "fetched_at": now, "source": "Collin County",
+        "date_range": date_range,
+        "total": len(records), "with_address": with_addr,
+        "records": records,
     }
-
-    for out_dir in [DATA_DIR, DASHBOARD_DIR]:
-        with open(out_dir / "records.json", "w") as f:
+    for d in [DATA_DIR, DASHBOARD_DIR]:
+        with open(d/"records.json","w") as f:
             json.dump(payload, f, indent=2, default=str)
-    log.info(f"Saved: {DATA_DIR}/records.json")
-    log.info(f"Saved: {DASHBOARD_DIR}/records.json")
 
-    # GHL CSV export
-    today = datetime.now().strftime("%Y%m%d")
+    today    = datetime.now().strftime("%Y%m%d")
     ghl_file = DATA_DIR / f"ghl_export_{today}.csv"
-    fieldnames = [
-        "First Name", "Last Name", "Mailing Address", "Mailing City",
-        "Mailing State", "Mailing Zip", "Property Address", "Property City",
-        "Property State", "Property Zip", "Lead Type", "Document Type",
-        "Date Filed", "Document Number", "Amount/Debt Owed", "Seller Score",
-        "Motivated Seller Flags", "Source", "Public Records URL",
+    fields   = [
+        "First Name","Last Name","Mailing Address","Mailing City",
+        "Mailing State","Mailing Zip","Property Address","Property City",
+        "Property State","Property Zip","Lead Type","Document Type",
+        "Date Filed","Document Number","Amount/Debt Owed",
+        "Seller Score","Motivated Seller Flags","Source","Public Records URL",
     ]
-
-    with open(ghl_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
+    with open(ghl_file,"w",newline="",encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
         for r in records:
-            name_parts = r.get("owner","").split()
-            first = name_parts[0].title() if name_parts else ""
-            last  = " ".join(name_parts[1:]).title() if len(name_parts) > 1 else ""
-            writer.writerow({
-                "First Name":           first,
-                "Last Name":            last,
+            parts = r.get("owner","").split()
+            w.writerow({
+                "First Name":           parts[0].title() if parts else "",
+                "Last Name":            " ".join(parts[1:]).title() if len(parts)>1 else "",
                 "Mailing Address":      r.get("mail_address",""),
                 "Mailing City":         r.get("mail_city",""),
                 "Mailing State":        r.get("mail_state",""),
@@ -573,50 +390,31 @@ def save_outputs(records: list[dict], date_range: dict):
                 "Source":               "Collin County",
                 "Public Records URL":   r.get("clerk_url",""),
             })
-
     log.info(f"GHL CSV: {ghl_file} ({len(records)} rows)")
-    log.info(f"━━━ Complete: {len(records)} records ({with_address} with address)")
-
-
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
+    log.info(f"━━━ Complete: {len(records)} records ({with_addr} with address)")
 
 async def main():
-    end_dt   = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
+    end_dt    = datetime.now(timezone.utc)
+    start_dt  = end_dt - timedelta(days=LOOKBACK_DAYS)
     start_str = start_dt.strftime("%Y-%m-%d")
     end_str   = end_dt.strftime("%Y-%m-%d")
-    date_range = {"start": start_str, "end": end_str}
+    log.info(f"Collin County scraper: {start_str} → {end_str}")
 
-    log.info(f"Collin County scraper starting: {start_str} → {end_str}")
+    parcel_by_owner, _ = load_parcel_data()
+    clerk   = await fetch_clerk_records(start_str, end_str)
+    probate = await fetch_probate_records(start_str, end_str)
+    all_rec = clerk + probate
 
-    # Load parcel data
-    parcel_by_owner = load_parcel_data()
-
-    # Fetch leads
-    clerk_records       = await fetch_clerk_records(start_str, end_str)
-    probate_records     = await fetch_probate_records(start_str, end_str)
-    foreclosure_records = fetch_foreclosure_notices(start_str, end_str)
-
-    all_records = clerk_records + probate_records + foreclosure_records
-
-    log.info(f"Raw totals — Clerk: {len(clerk_records)} | "
-             f"Probate: {len(probate_records)} | "
-             f"Foreclosure: {len(foreclosure_records)}")
-
-    # Enrich + score
     final = []
-    for rec in all_records:
+    for rec in all_rec:
         try:
             rec = enrich_record(rec, parcel_by_owner)
             rec["score"], rec["flags"] = score_record(rec)
             final.append(rec)
         except Exception as e:
-            log.warning(f"Enrich failed for {rec.get('doc_num','?')}: {e}")
+            log.warning(f"Enrich failed {rec.get('doc_num','?')}: {e}")
 
-    save_outputs(final, date_range)
-
+    save_outputs(final, {"start": start_str, "end": end_str})
 
 if __name__ == "__main__":
     asyncio.run(main())
