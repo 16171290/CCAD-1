@@ -2,126 +2,150 @@
 CCAD Parcel Export by Zip Code
 scraper/export_parcels.py
 
-Downloads CCAD residential parcel data from Texas Open Data Portal
-and exports filtered CSV for target Collin County zip codes.
-Mirrors the DCAD export_parcels.py structure exactly.
-
-Run: python scraper/export_parcels.py
+Uses confirmed CCAD column names from Texas Open Data Portal.
 """
 
-import csv
-import json
-import logging
-import sys
+import csv, json, logging, sys
 from datetime import datetime
 from pathlib import Path
-
 import requests
 
-logging.basicConfig(
-    level=logging.INFO,
+logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+    handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger("ccad_export")
 
-# ─────────────────────────────────────────────────────────────
-# Target zip codes
-# ─────────────────────────────────────────────────────────────
 TARGET_ZIPS = {
-    "75098",                                          # Wylie
-    "75023","75024","75025","75074","75075",
-    "75252","75093",                                  # Plano
-    "75080","75082",                                  # Richardson
-    "75002",                                          # Allen
-    "75069","75070",                                  # McKinney
+    "75098",
+    "75023","75024","75025","75074","75075","75252","75093",
+    "75080","75082",
+    "75002",
+    "75069","75070",
 }
 
-# ─────────────────────────────────────────────────────────────
-# CCAD Socrata API
-# ─────────────────────────────────────────────────────────────
-CCAD_API_URL = "https://data.texas.gov/resource/6dqt-e958.json"
-PAGE_SIZE    = 50000
+# Confirmed CCAD column names from dataset
+# propYear, propID, geoID, propType, propSubType,
+# "Situst street number", situsStreetPrefix, "Street Name",
+# situsStreetSuffix, "Situs Address", City, Zip, situsConcat,
+# ownerName, ownerName2, "Mailing address", ownerAddrLine2,
+# "Mailing City", "Mailing St", "Mailing zip", ownerAddrCountry,
+# deedTypeCd, deedNum, deedBook, deedPage, "Deed Date", deedFileDate,
+# imprvYearBuilt, imprvClassCd, imprvMainArea, imprvUnits,
+# imprvPoolFlag, imprvCategoryCodes, landTypeCode, landSizeAcres,
+# landSizeSqft, landAgAcres, landCategoryCodes, exemptCodes,
+# prevVal* fields
 
-# ─────────────────────────────────────────────────────────────
-# Paths
-# ─────────────────────────────────────────────────────────────
+# Socrata API — try 2025 first then 2024
+CCAD_APIS = [
+    "https://data.texas.gov/resource/vffy-snc6.json",  # 2025
+    "https://data.texas.gov/resource/6dqt-e958.json",  # 2024
+]
+PAGE_SIZE = 50000
+
 ROOT     = Path(__file__).parent.parent
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# ─────────────────────────────────────────────────────────────
-# Column mapping: Socrata field → output CSV column
-# ─────────────────────────────────────────────────────────────
-COLUMN_MAP = {
-    "owner_name":    "Owner Name",
-    "situs_num":     "Property Street Number",
-    "situs_street":  "Property Street",
-    "situs_city":    "Property City",
-    "situs_zip":     "Property Zip",
-    "mail_addr":     "Mailing Address",
-    "mail_city":     "Mailing City",
-    "mail_state":    "Mailing State",
-    "mail_zip":      "Mailing Zip",
-    "yr_impr":       "Year Built",
-    "impr_sqft":     "Living Area SqFt",
-    "bedrooms":      "Bedrooms",
-    "bathrooms":     "Bathrooms",
-    "deed_date":     "Deed Transfer Date",
-    "appraised_val": "Appraised Value",
-    "prop_type_cd":  "Property Type",
-    "geo_id":        "Account Number",
+# Map confirmed column names → output names
+# Note: Socrata lowercases and replaces spaces with underscores
+SOCRATA_FIELD_MAP = {
+    # Socrata API field      : output column name
+    "geoid":                  "Account Number",
+    "proptype":               "Property Type",
+    "ownername":              "Owner Name",
+    "ownername2":             "Owner Name 2",
+    "situst_street_number":   "Property Street Number",
+    "situsstreetprefix":      "Street Prefix",
+    "street_name":            "Street Name",
+    "situsstreetsuffix":      "Street Suffix",
+    "situs_address":          "Situs Address",
+    "city":                   "Property City",
+    "zip":                    "Property Zip",
+    "situsconcat":            "Full Situs Address",
+    "mailing_address":        "Mailing Address",
+    "owneraddrline2":         "Mailing Address 2",
+    "mailing_city":           "Mailing City",
+    "mailing_st":             "Mailing State",
+    "mailing_zip":            "Mailing Zip",
+    "deed_date":              "Deed Date",
+    "deedfiledate":           "Deed File Date",
+    "imprvyearbuilt":         "Year Built",
+    "imprvclasskcd":          "Improvement Class",
+    "imprymainarea":          "Living Area SqFt",
+    "imprvunits":             "Units",
+    "prevvalmarket":          "Market Value",
+    "prevvalappraised":       "Appraised Value",
 }
 
 OUTPUT_COLUMNS = [
-    "Account Number", "Owner Name",
-    "Property Street Number", "Property Street", "Property City", "Property Zip",
+    "Account Number", "Property Type", "Owner Name", "Owner Name 2",
+    "Full Situs Address", "Property Street Number", "Street Name",
+    "Property City", "Property Zip",
     "Mailing Address", "Mailing City", "Mailing State", "Mailing Zip",
-    "Year Built", "Living Area SqFt", "Bedrooms", "Bathrooms",
-    "Deed Transfer Date", "Appraised Value", "Property Type",
+    "Year Built", "Living Area SqFt", "Deed Date", "Deed File Date",
+    "Market Value", "Appraised Value",
 ]
 
 
-def fetch_parcels_for_zip(zip_code: str, session: requests.Session) -> list[dict]:
-    """Fetch all residential parcels for a specific zip code."""
-    records = []
-    offset  = 0
-
-    while True:
-        params = {
-            "$limit":  PAGE_SIZE,
-            "$offset": offset,
-            "$where":  f"situs_zip='{zip_code}' AND prop_type_cd='R'",
-        }
+def find_working_api():
+    """Find which API endpoint and field names work."""
+    for url in CCAD_APIS:
         try:
-            resp = session.get(CCAD_API_URL, params=params, timeout=60)
-            resp.raise_for_status()
-            rows = resp.json()
-            if not rows:
-                break
-            records.extend(rows)
-            if len(rows) < PAGE_SIZE:
-                break
-            offset += PAGE_SIZE
+            resp = requests.get(url, params={"$limit": 2}, timeout=30)
+            if resp.status_code == 200:
+                rows = resp.json()
+                if rows:
+                    log.info(f"✅ API working: {url}")
+                    log.info(f"   Columns: {list(rows[0].keys())[:15]}")
+                    return url, list(rows[0].keys())
         except Exception as e:
-            log.warning(f"  ZIP {zip_code} offset {offset} error: {e}")
-            break
-
-    return records
+            log.warning(f"API {url}: {e}")
+    return None, []
 
 
-def row_to_output(row: dict) -> dict:
-    """Convert Socrata row to output CSV format."""
-    out = {}
-    for api_field, col_name in COLUMN_MAP.items():
-        out[col_name] = str(row.get(api_field, "") or "").strip()
+def map_row(row, columns):
+    """Map a Socrata row to output using flexible field matching."""
+    col_lower = {c.lower().replace(" ","_").replace("-","_"): c for c in columns}
+    
+    def get(*candidates):
+        for c in candidates:
+            key = c.lower().replace(" ","_").replace("-","_")
+            if key in col_lower:
+                return str(row.get(col_lower[key], "") or "").strip()
+        return ""
 
-    # Build full property address
-    num    = out.get("Property Street Number", "")
-    street = out.get("Property Street", "")
-    out["Property Address"] = f"{num} {street}".strip()
+    situs_num  = get("situst_street_number", "situs_street_number", "str_num", "house_num")
+    street_pfx = get("situsstreetprefix", "street_prefix", "str_pfx")
+    street_nm  = get("street_name", "str_name", "situs_street")
+    street_sfx = get("situsstreetsuffix", "street_suffix", "str_sfx")
+    situs_full = get("situsconcat", "situs_address", "situs_addr")
 
-    return out
+    # Build full address if situsConcat not available
+    if not situs_full:
+        parts = [p for p in [situs_num, street_pfx, street_nm, street_sfx] if p]
+        situs_full = " ".join(parts)
+
+    return {
+        "Account Number":        get("geoid","geo_id","propid","prop_id"),
+        "Property Type":         get("proptype","prop_type","propsubtype"),
+        "Owner Name":            get("ownername","owner_name","owner"),
+        "Owner Name 2":          get("ownername2","owner_name2"),
+        "Full Situs Address":    situs_full,
+        "Property Street Number":situs_num,
+        "Street Name":           street_nm,
+        "Property City":         get("city","situs_city","prop_city"),
+        "Property Zip":          get("zip","situs_zip","prop_zip","zipcode"),
+        "Mailing Address":       get("mailing_address","mail_addr","owneraddrline1"),
+        "Mailing City":          get("mailing_city","mail_city"),
+        "Mailing State":         get("mailing_st","mail_state","mailing_state"),
+        "Mailing Zip":           get("mailing_zip","mail_zip"),
+        "Year Built":            get("imprvyearbuilt","imprv_year_built","yr_built","year_built"),
+        "Living Area SqFt":      get("imprymainarea","imprvmainarea","imprv_main_area","living_sqft","sqft"),
+        "Deed Date":             get("deed_date","deeddate"),
+        "Deed File Date":        get("deedfiledate","deed_file_date"),
+        "Market Value":          get("prevvalmarket","prev_val_market","market_value"),
+        "Appraised Value":       get("prevvalappraised","prev_val_appraised","appraised_val"),
+    }
 
 
 def main():
@@ -129,87 +153,130 @@ def main():
     out_file = DATA_DIR / f"parcel_export_{today}.csv"
 
     log.info(f"CCAD Parcel Export — {len(TARGET_ZIPS)} target zip codes")
-    log.info(f"Output: {out_file}")
+
+    api_url, columns = find_working_api()
+    if not api_url:
+        log.error("No CCAD API available — cannot export parcels")
+        return
 
     session = requests.Session()
-    session.headers.update({"User-Agent": "IntenseHoldings-CCAD-Scraper/1.0"})
+    session.headers["User-Agent"] = "IntenseHoldings-CCAD/1.0"
 
-    all_rows = []
+    all_rows   = []
     zip_counts = {}
 
     for zip_code in sorted(TARGET_ZIPS):
         log.info(f"  Fetching ZIP {zip_code}...")
-        rows = fetch_parcels_for_zip(zip_code, session)
-        zip_counts[zip_code] = len(rows)
-        all_rows.extend(rows)
-        log.info(f"  ZIP {zip_code}: {len(rows)} parcels")
+        offset = 0
+        zip_rows = []
 
-    log.info(f"\nTotal parcels: {len(all_rows)}")
-    log.info("Breakdown by ZIP:")
-    for z, count in sorted(zip_counts.items()):
-        log.info(f"  {z}: {count:,}")
+        # Find zip field name
+        zip_field = None
+        for candidate in ["zip","situs_zip","prop_zip","zipcode","zip_code"]:
+            if any(c.lower().replace(" ","_") == candidate for c in columns):
+                zip_field = candidate
+                break
 
-    # Filter: long-term owners (deed date before 2005 = 20+ years)
-    # and owner-occupied (mailing address matches property address)
-    long_term = []
-    all_output = []
+        while True:
+            try:
+                if zip_field:
+                    params = {
+                        "$limit":  PAGE_SIZE,
+                        "$offset": offset,
+                        "$where":  f"{zip_field}='{zip_code}'",
+                    }
+                else:
+                    params = {"$limit": PAGE_SIZE, "$offset": offset}
 
-    for row in all_rows:
-        out = row_to_output(row)
-        all_output.append(out)
+                resp = session.get(api_url, params=params, timeout=60)
+                if resp.status_code != 200:
+                    log.warning(f"  ZIP {zip_code}: HTTP {resp.status_code}")
+                    break
 
-        # Long-term owner filter
-        deed_date = out.get("Deed Transfer Date", "")
-        try:
-            deed_year = int(str(deed_date)[:4])
-            if deed_year <= 2005:
-                long_term.append(out)
-        except:
-            pass
+                rows = resp.json()
+                if not rows:
+                    break
 
-    # Save full export
-    output_cols = OUTPUT_COLUMNS + ["Property Address"]
-    with open(out_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=output_cols, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(all_output)
+                # Filter locally if no zip filter applied
+                if not zip_field:
+                    rows = [r for r in rows
+                            if str(r.get("zip","") or r.get("situs_zip","") or "").strip() == zip_code]
 
-    log.info(f"\n✅ Full export saved: {out_file} ({len(all_output):,} rows)")
+                zip_rows.extend(rows)
+                if len(rows) < PAGE_SIZE:
+                    break
+                offset += PAGE_SIZE
 
-    # Save long-term owner filtered export
-    lt_file = DATA_DIR / f"longterm_owners_{today}.csv"
-    with open(lt_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=output_cols, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(long_term)
+            except Exception as e:
+                log.warning(f"  ZIP {zip_code} error: {e}")
+                break
 
-    log.info(f"✅ Long-term owners saved: {lt_file} ({len(long_term):,} rows)")
-    log.info(f"   (Properties with deed date ≤ 2005 — 20+ year owners)")
+        zip_counts[zip_code] = len(zip_rows)
+        all_rows.extend(zip_rows)
+        log.info(f"  ZIP {zip_code}: {len(zip_rows):,} parcels")
 
-    # Save address lookup JSON for offer engine
+    log.info(f"\nTotal: {len(all_rows):,} parcels")
+
+    # Convert and filter residential only
+    residential = []
+    long_term   = []
     addr_lookup = {}
+
     for row in all_rows:
-        out = row_to_output(row)
-        addr = out.get("Property Address", "").upper().strip()
-        city = out.get("Property City", "").upper().strip()
+        out = map_row(row, columns)
+
+        # Filter residential (propType A=residential in CCAD)
+        prop_type = out.get("Property Type","").upper()
+        if prop_type and prop_type not in ("A","R","RESIDENTIAL","") :
+            if not any(x in prop_type for x in ["A","R",""]):
+                continue
+
+        residential.append(out)
+
+        # Long-term owner filter (deed date ≤ 2005)
+        deed = out.get("Deed Date","")
+        try:
+            yr = int(str(deed)[:4])
+            if yr <= 2005:
+                long_term.append(out)
+        except: pass
+
+        # Build address lookup for offer engine
+        addr  = out.get("Full Situs Address","").upper().strip()
+        city  = out.get("Property City","").upper().strip()
         if addr and city:
-            key = f"{addr} {city}"
-            addr_lookup[key] = {
-                "sqft":      out.get("Living Area SqFt", ""),
-                "beds":      out.get("Bedrooms", ""),
-                "baths":     out.get("Bathrooms", ""),
-                "yr_built":  out.get("Year Built", ""),
-                "zip":       out.get("Property Zip", ""),
-                "owner":     out.get("Owner Name", ""),
-                "deed_date": out.get("Deed Transfer Date", ""),
+            addr_lookup[f"{addr} {city}"] = {
+                "sqft":      out.get("Living Area SqFt",""),
+                "yr_built":  out.get("Year Built",""),
+                "zip":       out.get("Property Zip",""),
+                "owner":     out.get("Owner Name",""),
+                "deed_date": out.get("Deed Date",""),
             }
 
-    lookup_file = DATA_DIR / "ccad_address_lookup.json"
-    with open(lookup_file, "w") as f:
-        json.dump(addr_lookup, f)
-    log.info(f"✅ Address lookup saved: {lookup_file} ({len(addr_lookup):,} entries)")
-    log.info("   (Used by offer engine for address-only property lookup)")
+    # Save full export
+    with open(out_file,"w",newline="",encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(residential)
+    log.info(f"✅ Full export: {out_file} ({len(residential):,} rows)")
 
+    # Save long-term owners
+    lt_file = DATA_DIR / f"longterm_owners_{today}.csv"
+    with open(lt_file,"w",newline="",encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(long_term)
+    log.info(f"✅ Long-term owners: {lt_file} ({len(long_term):,} rows, deed ≤ 2005)")
+
+    # Save address lookup
+    lookup_file = DATA_DIR / "ccad_address_lookup.json"
+    with open(lookup_file,"w") as f:
+        json.dump(addr_lookup, f)
+    log.info(f"✅ Address lookup: {lookup_file} ({len(addr_lookup):,} entries)")
+
+    log.info("\nBreakdown by ZIP:")
+    for z, cnt in sorted(zip_counts.items()):
+        log.info(f"  {z}: {cnt:,}")
 
 if __name__ == "__main__":
     main()
