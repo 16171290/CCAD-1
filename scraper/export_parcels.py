@@ -132,17 +132,10 @@ def main():
 
         while True:
             try:
-                # Try with residential filter first
-                params = {
-                    "$limit":  PAGE_SIZE,
-                    "$offset": offset,
-                    "$where":  f"situs_zip='{zip_code}' AND prop_type_cd='R'",
-                }
-                resp = session.get(api_url, params=params, timeout=90)
-
-                if resp.status_code == 400:
-                    params["$where"] = f"situs_zip='{zip_code}'"
-                    resp = session.get(api_url, params=params, timeout=90)
+                # Fetch without $where — filter locally
+                # ($where returns 400 for this Socrata dataset)
+                params = {"$limit": PAGE_SIZE, "$offset": offset}
+                resp = session.get(api_url, params=params, timeout=120)
 
                 if resp.status_code != 200:
                     log.warning(f"  ZIP {zip_code}: HTTP {resp.status_code}")
@@ -151,6 +144,12 @@ def main():
                 rows = resp.json()
                 if not rows:
                     break
+
+                # Filter locally by zip and residential type
+                rows = [r for r in rows if
+                        (r.get("situs_zip") or r.get("zip") or
+                         r.get("addr_zip","")) == zip_code
+                        and r.get("prop_type_cd","R") in ("R","Residential","")]
 
                 zip_rows.extend(rows)
                 if len(rows) < PAGE_SIZE:
