@@ -218,52 +218,125 @@ def score_record(record):
     return min(score, 100), flags
 
 async def fetch_clerk_records(start_date, end_date):
-    """Fetch LP/NOFC from Collin County Clerk via collin.tx.publicsearch.us"""
+    """
+    Fetch LP/NOFC/Lien records from Collin County Clerk.
+    Uses the publicsearch.us REST API that powers the web portal.
+    Portal: https://collin.tx.publicsearch.us/
+    """
     records = []
     log.info(f"Fetching Collin County Clerk records {start_date} → {end_date}")
 
-    doc_types = {
-        "LP":   "Lis Pendens",
-        "NOFC": "Notice of Foreclosure",
-        "LN":   "Lien",
-        "JUD":  "Judgment",
+    # publicsearch.us API base (Neumo platform used by many TX counties)
+    API_BASE   = "https://collin.tx.publicsearch.us"
+    SEARCH_API = f"{API_BASE}/api/search/instrument"
+
+    # Doc types to search — Collin County uses these instrument type codes
+    DOC_TYPES = [
+        ("LP",    "Lis Pendens",            "LP"),
+        ("NOFC",  "Notice of Foreclosure",  "NOFC"),
+        ("LN",    "Lien",                   "LN"),
+        ("JUD",   "Judgment",               "JUD"),
+        ("CCJ",   "Certified Judgment",     "CCJ"),
+        ("LNIRS", "IRS Lien",               "LNIRS"),
+        ("LNFED", "Federal Tax Lien",       "LNFED"),
+    ]
+
+    headers = {
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept":        "application/json, text/plain, */*",
+        "Referer":       f"{API_BASE}/",
+        "Origin":        API_BASE,
+        "Content-Type":  "application/json",
     }
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        page = await ctx.new_page()
+    session = requests.Session()
 
-        try:
-            await page.goto(CLERK_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=20000)
-            content = await page.content()
-            log.info(f"Clerk portal loaded — {len(content)} chars")
+    # First visit the main page to get session cookies
+    try:
+        session.get(API_BASE, headers=headers, timeout=15)
+    except Exception as e:
+        log.warning(f"Clerk session init: {e}")
 
-            # Look for search form elements
-            inputs = await page.query_selector_all("input, select, button")
-            log.info(f"Found {len(inputs)} form elements")
+    for cat, cat_label, doc_code in DOC_TYPES:
+        page_num = 0
+        while True:
+            try:
+                # Try REST API endpoint used by the portal
+                payload = {
+                    "departmentId": "RP",   # Real Property
+                    "docTypeCode":  doc_code,
+                    "startDate":    start_date,
+                    "endDate":      end_date,
+                    "page":         page_num,
+                    "pageSize":     100,
+                    "sortBy":       "recordedDate",
+                    "sortOrder":    "desc",
+                }
+                resp = session.post(SEARCH_API, json=payload,
+                                    headers=headers, timeout=30)
 
-            # Try to find date range inputs and doc type selector
-            # publicsearch.us uses a React interface
-            for doc_type, label in doc_types.items():
-                try:
-                    # Look for document type filter
-                    doc_selector = await page.query_selector(
-                        f"[data-value='{doc_type}'], option[value='{doc_type}']")
-                    if doc_selector:
-                        log.info(f"Found selector for {doc_type}")
-                except: pass
+                if resp.status_code == 404:
+                    # Try alternate endpoint format
+                    params = {
+                        "type":      "instrument",
+                        "docType":   doc_code,
+                        "startDate": start_date,
+                        "endDate":   end_date,
+                        "page":      page_num,
+                        "pageSize":  100,
+                    }
+                    resp = session.get(f"{API_BASE}/api/instruments",
+                                       params=params, headers=headers, timeout=30)
 
-        except PWTimeout:
-            log.warning("Clerk portal timeout")
-        except Exception as e:
-            log.warning(f"Clerk portal error: {e}")
-        finally:
-            await browser.close()
+                if resp.status_code not in (200, 201):
+                    log.info(f"  {cat}: HTTP {resp.status_code} — trying next")
+                    break
 
-    log.info(f"Clerk records: {len(records)}")
+                data = resp.json()
+                hits = (data.get("results") or data.get("hits") or
+                        data.get("instruments") or data.get("data") or [])
+
+                if not hits:
+                    break
+
+                log.info(f"  {cat}: page {page_num} → {len(hits)} records")
+
+                for item in hits:
+                    grantor  = item.get("grantor","") or item.get("grantorName","") or ""
+                    grantee  = item.get("grantee","") or item.get("granteeName","") or ""
+                    doc_num  = item.get("instrumentNumber","") or item.get("docNumber","") or ""
+                    rec_date = item.get("recordedDate","") or item.get("filingDate","") or ""
+                    amount   = item.get("amount","") or item.get("consideration","") or ""
+                    legal    = item.get("legalDescription","") or item.get("legal","") or ""
+
+                    records.append({
+                        "doc_num":      str(doc_num),
+                        "doc_type":     cat,
+                        "filed":        str(rec_date)[:10],
+                        "cat":          cat,
+                        "cat_label":    cat_label,
+                        "owner":        str(grantor).upper().strip(),
+                        "grantee":      str(grantee).upper().strip(),
+                        "amount":       str(amount),
+                        "legal":        str(legal)[:200],
+                        "prop_address": "", "prop_city": "",
+                        "prop_state":   "TX", "prop_zip": "",
+                        "mail_address": "", "mail_city": "",
+                        "mail_state":   "", "mail_zip": "",
+                        "clerk_url":    f"{API_BASE}/result/RP/{doc_num}",
+                        "flags": [], "score": 30,
+                    })
+
+                total_pages = data.get("totalPages", data.get("pages", 1))
+                if page_num >= total_pages - 1 or len(hits) < 100:
+                    break
+                page_num += 1
+
+            except Exception as e:
+                log.warning(f"  {cat} page {page_num}: {e}")
+                break
+
+    log.info(f"Clerk records total: {len(records)}")
     return records
 
 async def fetch_probate_records(start_date, end_date):
