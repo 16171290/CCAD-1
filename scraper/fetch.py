@@ -131,26 +131,13 @@ def load_parcel_data():
 
         while True:
             try:
-                # Use confirmed field name: situs_zip
+                # Fetch without $where filter — filter locally by zip
+                # (Socrata $where filter returns 400 for this dataset)
                 params = {
                     "$limit":  PAGE_SIZE,
                     "$offset": offset,
-                    "$where":  f"situs_zip='{zip_code}' AND prop_type_cd='R'",
                 }
-                resp = session.get(api_url, params=params, timeout=90)
-
-                if resp.status_code == 400:
-                    # Fallback without prop_type filter
-                    params["$where"] = f"situs_zip='{zip_code}'"
-                    resp = session.get(api_url, params=params, timeout=90)
-
-                if resp.status_code == 400:
-                    # Last resort — try zip field name variants
-                    for zip_field in ["zip","situs_zip","addr_zip"]:
-                        params["$where"] = f"{zip_field}='{zip_code}'"
-                        resp = session.get(api_url, params=params, timeout=90)
-                        if resp.status_code == 200:
-                            break
+                resp = session.get(api_url, params=params, timeout=120)
 
                 if resp.status_code != 200:
                     log.warning(f"  ZIP {zip_code}: HTTP {resp.status_code}")
@@ -161,6 +148,17 @@ def load_parcel_data():
                     break
 
                 for row in rows:
+                    # Filter locally by zip using all possible field names
+                    row_zip = (gf(row,"situs_zip") or gf(row,"zip") or
+                               gf(row,"addr_zip") or "")
+                    if row_zip and row_zip != zip_code:
+                        continue
+
+                    # Filter residential only
+                    prop_type = gf(row,"prop_type_cd","proptype","state_cd")
+                    if prop_type and prop_type not in ("R","Residential",""):
+                        continue
+
                     # Confirmed field names from CCAD Field Descriptions
                     owner       = gf(row,"file_as_name").upper()
                     situs_disp  = gf(row,"situs_display")
@@ -294,8 +292,8 @@ async def fetch_clerk_records(start_date, end_date):
                     inp = await page.query_selector(
                         "input[type='text']:visible, input[type='search']:visible")
                     if inp:
-                        await inp.triple_click()
-                        await inp.type(doc_type, delay=80)
+                        await inp.click()
+                        await inp.fill(doc_type)
                         await page.wait_for_timeout(300)
 
                     # Click search
