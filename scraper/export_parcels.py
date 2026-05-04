@@ -95,9 +95,9 @@ def fetch_zip(session, zip_code):
                 if rz and rz != zip_code:
                     continue
 
-                # Keep Real property only (not Personal/Mineral)
-                pt = str(row.get("proptype","") or "").strip().upper()
-                if pt and pt not in ("REAL","R","RESIDENTIAL",""):
+                # Keep Real property only — exclude Personal, Mineral etc
+                pt = str(row.get("proptype","") or "").strip().lower()
+                if pt and pt not in ("real","r","residential"):
                     continue
 
                 # Build address
