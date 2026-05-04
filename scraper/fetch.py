@@ -171,18 +171,16 @@ def load_parcel_data():
                     "$limit":  PAGE_SIZE,
                     "$offset": offset,
                 }
-                if zip_field:
-                    params["$where"] = f"{zip_field}='{zip_code}'"
-                    if prop_type_field:
-                        params["$where"] += f" AND {prop_type_field}='R'"
+                # Use confirmed field names: situszip, proptype
+                params["$where"] = f"situszip='{zip_code}' AND proptype='R'"
 
-                resp = session.get(api_url, params=params, timeout=120)
+                resp = session.get(api_url, params=params, timeout=300)
 
-                # If $where fails, fall back to fetching all and filtering locally
+                # If $where fails fall back to no filter + local filtering
                 if resp.status_code == 400:
-                    log.warning(f"  $where failed, fetching all...")
+                    log.warning(f"  $where failed, fetching without filter...")
                     params = {"$limit": PAGE_SIZE, "$offset": offset}
-                    resp = session.get(api_url, params=params, timeout=120)
+                    resp = session.get(api_url, params=params, timeout=300)
 
                 if resp.status_code != 200:
                     log.warning(f"  ZIP {zip_code}: HTTP {resp.status_code}")
@@ -208,24 +206,28 @@ def load_parcel_data():
                         if pt and pt not in ("R","Residential",""):
                             continue
 
-                    # Confirmed field names from CCAD Field Descriptions
-                    owner       = gf(row,"file_as_name").upper()
-                    situs_disp  = gf(row,"situs_display")
-                    situs_num   = gf(row,"situs_num")
-                    situs_st    = gf(row,"situs_street")
-                    situs_city  = gf(row,"situs_city")
-                    situs_zip   = gf(row,"situs_zip") or zip_code
-                    mail_line1  = gf(row,"addr_line1")
-                    mail_city   = gf(row,"addr_city")
-                    mail_state  = gf(row,"addr_state")
-                    mail_zip    = gf(row,"addr_zip")
-                    living_area = gf(row,"living_area").replace(",","")
-                    yr_blt      = gf(row,"yr_blt")
-                    deed_dt     = gf(row,"deed_dt")
-                    beds        = gf(row,"beds")
-                    baths       = gf(row,"baths")
+                    # Confirmed Socrata field names from API discovery:
+                    # ownername, situsbldgnum, situsstreetname, situscity,
+                    # situszip, situsconcat, owneraddrline1, owneraddrcity,
+                    # owneraddrstate, owneraddrzip, imprvyearbuilt,
+                    # imprvmainarea, deedeffdate
+                    owner       = gf(row,"ownername").upper()
+                    situs_disp  = gf(row,"situsconcat","situsconcatshort")
+                    situs_num   = gf(row,"situsbldgnum")
+                    situs_st    = gf(row,"situsstreetname")
+                    situs_city  = gf(row,"situscity")
+                    situs_zip   = gf(row,"situszip") or zip_code
+                    mail_line1  = gf(row,"owneraddrline1")
+                    mail_city   = gf(row,"owneraddrcity")
+                    mail_state  = gf(row,"owneraddrstate")
+                    mail_zip    = gf(row,"owneraddrzip")
+                    living_area = gf(row,"imprvmainarea").replace(",","")
+                    yr_blt      = gf(row,"imprvyearbuilt")
+                    deed_dt     = gf(row,"deedeffdate")
+                    beds        = gf(row,"beds","imprvbeds")
+                    baths       = gf(row,"baths","imprvbaths")
 
-                    # Build full address from situs_display or components
+                    # Build full address
                     if not situs_disp:
                         parts = [p for p in [situs_num, situs_st] if p]
                         situs_disp = " ".join(parts)
