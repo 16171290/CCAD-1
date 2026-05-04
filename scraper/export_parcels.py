@@ -79,32 +79,33 @@ def gf(row, *keys):
 
 def map_row(row):
     """Map using confirmed CCAD field names."""
-    situs_disp = gf(row,"situs_display")
-    situs_num  = gf(row,"situs_num")
-    situs_st   = gf(row,"situs_street")
+    # Confirmed Socrata API field names from discovery:
+    situs_disp = gf(row,"situsconcat","situsconcatshort")
+    situs_num  = gf(row,"situsbldgnum")
+    situs_st   = gf(row,"situsstreetname")
     if not situs_disp:
         situs_disp = f"{situs_num} {situs_st}".strip()
 
-    sqft = gf(row,"living_area").replace(",","")
+    sqft = gf(row,"imprvmainarea").replace(",","")
 
     return {
-        "Account Number":   gf(row,"geo_id","prop_id"),
-        "Owner Name":       gf(row,"file_as_name"),
+        "Account Number":   gf(row,"geoid","propid"),
+        "Owner Name":       gf(row,"ownername"),
         "Property Address": situs_disp,
-        "Property City":    gf(row,"situs_city"),
-        "Property Zip":     gf(row,"situs_zip"),
-        "Mailing Address":  gf(row,"addr_line1"),
-        "Mailing City":     gf(row,"addr_city"),
-        "Mailing State":    gf(row,"addr_state"),
-        "Mailing Zip":      gf(row,"addr_zip"),
-        "Year Built":       gf(row,"yr_blt"),
+        "Property City":    gf(row,"situscity"),
+        "Property Zip":     gf(row,"situszip"),
+        "Mailing Address":  gf(row,"owneraddrline1"),
+        "Mailing City":     gf(row,"owneraddrcity"),
+        "Mailing State":    gf(row,"owneraddrstate"),
+        "Mailing Zip":      gf(row,"owneraddrzip"),
+        "Year Built":       gf(row,"imprvyearbuilt"),
         "Living Area SqFt": sqft,
         "Beds":             gf(row,"beds"),
         "Baths":            gf(row,"baths"),
-        "Deed Date":        gf(row,"deed_dt"),
-        "Market Value":     gf(row,"cert_market","curr_market"),
-        "Appraised Value":  gf(row,"cert_appraised_val","curr_appraised_val"),
-        "Property Type":    gf(row,"prop_type_cd"),
+        "Deed Date":        gf(row,"deedeffdate"),
+        "Market Value":     gf(row,"currvalmarket","prevvalmarket"),
+        "Appraised Value":  gf(row,"currvalappraised","prevvalappraised"),
+        "Property Type":    gf(row,"proptype"),
         "Long Term Owner":  "",
     }
 
@@ -132,10 +133,13 @@ def main():
 
         while True:
             try:
-                # Fetch without $where — filter locally
-                # ($where returns 400 for this Socrata dataset)
-                params = {"$limit": PAGE_SIZE, "$offset": offset}
-                resp = session.get(api_url, params=params, timeout=120)
+                # Confirmed field names: situszip, proptype
+                params["$where"] = f"situszip='{zip_code}' AND proptype='R'"
+                resp = session.get(api_url, params=params, timeout=300)
+
+                if resp.status_code == 400:
+                    params = {"$limit": PAGE_SIZE, "$offset": offset}
+                    resp = session.get(api_url, params=params, timeout=300)
 
                 if resp.status_code != 200:
                     log.warning(f"  ZIP {zip_code}: HTTP {resp.status_code}")
@@ -145,11 +149,10 @@ def main():
                 if not rows:
                     break
 
-                # Filter locally by zip and residential type
-                rows = [r for r in rows if
-                        (r.get("situs_zip") or r.get("zip") or
-                         r.get("addr_zip","")) == zip_code
-                        and r.get("prop_type_cd","R") in ("R","Residential","")]
+                # Local filter fallback if $where not applied
+                rows = [r for r in rows
+                        if str(r.get("situszip","") or "").strip() == zip_code
+                        and str(r.get("proptype","R") or "R").strip() in ("R","")]
 
                 zip_rows.extend(rows)
                 if len(rows) < PAGE_SIZE:
@@ -188,16 +191,18 @@ def main():
         # Address lookup for offer engine
         addr = out.get("Property Address","").upper().strip()
         city = out.get("Property City","").upper().strip()
+        # Also index by short address (without city)
         if addr and city:
-            addr_lookup[f"{addr} {city}"] = {
-                "sqft":      out.get("Living Area SqFt",""),
-                "beds":      out.get("Beds",""),
-                "baths":     out.get("Baths",""),
-                "yr_built":  out.get("Year Built",""),
-                "zip":       out.get("Property Zip",""),
-                "owner":     out.get("Owner Name",""),
-                "deed_date": out.get("Deed Date",""),
-            }
+            for key in [f"{addr} {city}", addr]:
+                addr_lookup[key] = {
+                    "sqft":      out.get("Living Area SqFt",""),
+                    "beds":      out.get("Beds",""),
+                    "baths":     out.get("Baths",""),
+                    "yr_built":  out.get("Year Built",""),
+                    "zip":       out.get("Property Zip",""),
+                    "owner":     out.get("Owner Name",""),
+                    "deed_date": out.get("Deed Date",""),
+                }
 
     # Save full export
     with open(out_file,"w",newline="",encoding="utf-8") as f:
