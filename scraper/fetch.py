@@ -124,6 +124,41 @@ def load_parcel_data():
     parcel_by_address = {}
     total = 0
 
+    # Step 1: Discover actual zip field name from a sample record
+    zip_field = None
+    prop_type_field = None
+    try:
+        sample = session.get(api_url, params={"$limit": 1}, timeout=30).json()
+        if sample:
+            cols = list(sample[0].keys())
+            log.info(f"All API columns ({len(cols)}): {cols}")
+            # Find zip field
+            zip_candidates = ["situs_zip","zip","situszip","situs_zip_cd",
+                              "addr_zip","property_zip","zipcode","zip_code"]
+            for c in zip_candidates:
+                if c in cols:
+                    zip_field = c
+                    log.info(f"✅ Zip field: {zip_field}")
+                    break
+            if not zip_field:
+                # Check partial matches
+                for c in cols:
+                    if "zip" in c.lower():
+                        zip_field = c
+                        log.info(f"✅ Zip field (partial): {zip_field}")
+                        break
+            # Find prop type field
+            type_candidates = ["prop_type_cd","proptype","state_cd","property_type_cd"]
+            for c in type_candidates:
+                if c in cols:
+                    prop_type_field = c
+                    log.info(f"✅ PropType field: {prop_type_field}")
+                    break
+            if not zip_field:
+                log.warning(f"No zip field found! Columns: {cols}")
+    except Exception as e:
+        log.warning(f"Field discovery failed: {e}")
+
     for zip_code in sorted(TARGET_ZIPS):
         offset   = 0
         zip_rows = []
@@ -131,13 +166,23 @@ def load_parcel_data():
 
         while True:
             try:
-                # Fetch without $where filter — filter locally by zip
-                # (Socrata $where filter returns 400 for this dataset)
+                # Try $where with discovered zip field
                 params = {
                     "$limit":  PAGE_SIZE,
                     "$offset": offset,
                 }
+                if zip_field:
+                    params["$where"] = f"{zip_field}='{zip_code}'"
+                    if prop_type_field:
+                        params["$where"] += f" AND {prop_type_field}='R'"
+
                 resp = session.get(api_url, params=params, timeout=120)
+
+                # If $where fails, fall back to fetching all and filtering locally
+                if resp.status_code == 400:
+                    log.warning(f"  $where failed, fetching all...")
+                    params = {"$limit": PAGE_SIZE, "$offset": offset}
+                    resp = session.get(api_url, params=params, timeout=120)
 
                 if resp.status_code != 200:
                     log.warning(f"  ZIP {zip_code}: HTTP {resp.status_code}")
@@ -148,16 +193,20 @@ def load_parcel_data():
                     break
 
                 for row in rows:
-                    # Filter locally by zip using all possible field names
-                    row_zip = (gf(row,"situs_zip") or gf(row,"zip") or
-                               gf(row,"addr_zip") or "")
+                    # Filter by zip
+                    if zip_field:
+                        row_zip = str(row.get(zip_field,"") or "").strip()
+                    else:
+                        row_zip = (gf(row,"situs_zip","zip","addr_zip",
+                                      "situszip","zipcode","zip_code") or "")
                     if row_zip and row_zip != zip_code:
                         continue
 
-                    # Filter residential only
-                    prop_type = gf(row,"prop_type_cd","proptype","state_cd")
-                    if prop_type and prop_type not in ("R","Residential",""):
-                        continue
+                    # Filter residential
+                    if prop_type_field:
+                        pt = str(row.get(prop_type_field,"") or "").strip()
+                        if pt and pt not in ("R","Residential",""):
+                            continue
 
                     # Confirmed field names from CCAD Field Descriptions
                     owner       = gf(row,"file_as_name").upper()
