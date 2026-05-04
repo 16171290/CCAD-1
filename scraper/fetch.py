@@ -124,11 +124,8 @@ def fetch_zip_parcels(session, zip_code):
                 if row_zip and row_zip != zip_code:
                     continue
 
-                # Keep residential: proptype 'R', 'Real', 'REAL', 'Residential'
-                # or empty (all residential dataset)
-                if row_ptype and row_ptype not in (
-                    "R","REAL","RESIDENTIAL","RES","RESID"
-                ):
+                # Keep Real property only — confirmed values: Real, Personal, Mineral
+                if row_ptype and row_ptype not in ("REAL","R","RESIDENTIAL",""):
                     continue
 
                 # Build record using confirmed field names
