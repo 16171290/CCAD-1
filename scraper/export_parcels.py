@@ -90,9 +90,14 @@ def fetch_zip(session, zip_code):
                          f"ownername={str(s.get('ownername','?'))[:25]}")
 
             for row in batch:
-                # Local zip filter (for fallback fetches)
+                # Local zip filter
                 rz = str(row.get("situszip","") or "").strip()
                 if rz and rz != zip_code:
+                    continue
+
+                # Keep Real property only (not Personal/Mineral)
+                pt = str(row.get("proptype","") or "").strip().upper()
+                if pt and pt not in ("REAL","R","RESIDENTIAL",""):
                     continue
 
                 # Build address
