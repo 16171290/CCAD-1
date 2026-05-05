@@ -107,7 +107,43 @@ def fetch_zip(session, zip_code):
                         continue
                 except: pass
 
-                # Use situsconcat and strip ", CITY, TX ZIP" suffix
+                # Exclude entities — companies, HOAs, cities, trusts etc.
+                owner_raw = str(row.get("ownername","") or "").upper().strip()
+                entity_keywords = [
+                    "LLC","INC","CORP","LTD"," LP ","L.P.","L.L.C.",
+                    "TRUST","TRUSTEE","ESTATE OF",
+                    "HOA","HOMEOWNERS","HOMEOWNER ASSOC",
+                    "CITY OF","COUNTY OF","STATE OF",
+                    "ASSOCIATION","ASSOC ","ASSN ",
+                    "PROPERTIES","HOLDINGS","INVESTMENTS","VENTURES",
+                    "REALTY","DEVELOPMENT","DEVELOPERS",
+                    "PARTNERS","PARTNERSHIP"," GROUP","FUND ",
+                    "CHURCH","SCHOOL DISTRICT","AUTHORITY",
+                    "BANK","FINANCIAL","MORTGAGE","CAPITAL",
+                    "CROSSING","LIMITED",
+                ]
+                if any(kw in owner_raw for kw in entity_keywords):
+                    continue
+
+                # Build clean address — use situsconcat, strip ", CITY, TX ZIP" suffix
+                full = gv(row,"situsconcat","situsconcatshort")
+                addr = full.split(",")[0].strip() if full else ""
+                if not addr:
+                    num  = gv(row,"situsbldgnum").strip()
+                    st   = gv(row,"situsstreetname").strip()
+                    addr = f"{num} {st}".strip()
+
+                # Exclude apartments/condos
+                apt_check = re.compile(
+                    r"\b(APT|UNIT|STE|SUITE|BLDG|FL|FLOOR)\b|\d+/\d+",
+                    re.IGNORECASE
+                )
+                # Also detect trailing unit numbers like "3801 14TH ST 1901"
+                trailing_unit = re.compile(r"\s+\d{3,4}[A-Z]?\s*$")
+                if apt_check.search(addr) or trailing_unit.search(addr):
+                    continue
+
+                # Use situsconcat and strip ", CITY, TX ZIP" suffix (kept for fallback ref)
                 # e.g. "5703 ABINGDON DR , RICHARDSON, TX 75082" → "5703 ABINGDON DR"
                 full = gv(row,"situsconcat","situsconcatshort")
                 addr = full.split(",")[0].strip() if full else ""
@@ -120,19 +156,32 @@ def fetch_zip(session, zip_code):
                 sqft = gv(row,"imprvmainarea").replace(",","")
 
                 # Split owner name into First / Last
+                # CCAD format: "LASTNAME FIRSTNAME" or "LASTNAME FIRSTNAME &" for joint
                 owner_full = gv(row,"ownername").strip()
-                if "&" in owner_full or " AND " in owner_full.upper():
-                    # Joint owners — keep full name in Last Name field
-                    first_name = ""
-                    last_name  = owner_full.title()
+
+                if "&" in owner_full:
+                    # Joint owners e.g. "STAUFFER JANE &" or "YANCEY BRENT &"
+                    # Remove trailing & and split
+                    clean = owner_full.replace("&","").strip()
+                    parts = clean.split()
+                    if len(parts) >= 2:
+                        last_name  = parts[0].title()
+                        first_name = " ".join(parts[1:]).title() + " &"
+                    else:
+                        last_name  = clean.title()
+                        first_name = ""
                 elif len(owner_full.split()) >= 2:
-                    # CCAD format: LASTNAME FIRSTNAME MIDDLE
+                    # Standard: LASTNAME FIRSTNAME MIDDLE
                     parts      = owner_full.split()
                     last_name  = parts[0].title()
                     first_name = " ".join(parts[1:]).title()
-                else:
-                    first_name = ""
+                elif owner_full:
+                    # Single name
                     last_name  = owner_full.title()
+                    first_name = ""
+                else:
+                    last_name  = ""
+                    first_name = ""
 
                 # Year only from deed date
                 deed_full = gv(row,"deedeffdate")
