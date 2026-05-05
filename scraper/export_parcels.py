@@ -35,10 +35,10 @@ DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 OUTPUT_COLUMNS = [
-    "Account Number","Owner Name",
-    "Property Address","Property City","Property Zip",
+    "Account Number","First Name","Last Name",
     "Mailing Address","Mailing City","Mailing State","Mailing Zip",
-    "Year Built","Living Area SqFt","Deed Date",
+    "Property Address","Property City","Property Zip",
+    "Deed Year","Year Built","Living Area SqFt",
     "Market Value","Appraised Value","Property Type","Long Term Owner",
 ]
 
@@ -109,19 +109,39 @@ def fetch_zip(session, zip_code):
 
                 sqft = gv(row,"imprvmainarea").replace(",","")
 
+                # Split owner name into First / Last
+                owner_full = gv(row,"ownername").strip()
+                if "&" in owner_full or " AND " in owner_full.upper():
+                    # Joint owners — keep full name in Last Name field
+                    first_name = ""
+                    last_name  = owner_full.title()
+                elif len(owner_full.split()) >= 2:
+                    # CCAD format: LASTNAME FIRSTNAME MIDDLE
+                    parts      = owner_full.split()
+                    last_name  = parts[0].title()
+                    first_name = " ".join(parts[1:]).title()
+                else:
+                    first_name = ""
+                    last_name  = owner_full.title()
+
+                # Year only from deed date
+                deed_full = gv(row,"deedeffdate")
+                deed_year = str(deed_full)[:4] if deed_full else ""
+
                 results.append({
                     "Account Number":   gv(row,"geoid","propid"),
-                    "Owner Name":       gv(row,"ownername"),
-                    "Property Address": addr,
-                    "Property City":    gv(row,"situscity"),
-                    "Property Zip":     rz or zip_code,
+                    "First Name":       first_name,
+                    "Last Name":        last_name,
                     "Mailing Address":  gv(row,"owneraddrline1"),
                     "Mailing City":     gv(row,"owneraddrcity"),
                     "Mailing State":    gv(row,"owneraddrstate"),
                     "Mailing Zip":      gv(row,"owneraddrzip"),
+                    "Property Address": addr,
+                    "Property City":    gv(row,"situscity"),
+                    "Property Zip":     rz or zip_code,
+                    "Deed Year":        deed_year,
                     "Year Built":       gv(row,"imprvyearbuilt"),
                     "Living Area SqFt": sqft,
-                    "Deed Date":        gv(row,"deedeffdate"),
                     "Market Value":     gv(row,"currvalmarket","prevvalmarket"),
                     "Appraised Value":  gv(row,"currvalappraised","prevvalappraised"),
                     "Property Type":    gv(row,"proptype"),
@@ -178,11 +198,21 @@ def main():
                     "sqft":      out.get("Living Area SqFt",""),
                     "yr_built":  out.get("Year Built",""),
                     "zip":       out.get("Property Zip",""),
-                    "owner":     out.get("Owner Name",""),
-                    "deed_date": out.get("Deed Date",""),
+                    "owner":     f"{out.get('First Name','')} {out.get('Last Name','')}".strip(),
+                    "deed_date": out.get("Deed Year",""),
                 }
                 addr_lookup[f"{addr} {city}".strip()] = entry
                 addr_lookup[addr] = entry
+
+    # Sort by Property City then Property Address ascending
+    all_rows.sort(key=lambda x: (
+        x.get("Property City","").upper(),
+        x.get("Property Address","").upper()
+    ))
+    long_term.sort(key=lambda x: (
+        x.get("Property City","").upper(),
+        x.get("Property Address","").upper()
+    ))
 
     # Save full export
     out_file = DATA_DIR / f"parcel_export_{today}.csv"
