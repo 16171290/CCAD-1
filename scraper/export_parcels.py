@@ -112,15 +112,17 @@ def fetch_zip(session, zip_code):
                 entity_keywords = [
                     "LLC","INC","CORP","LTD"," LP ","L.P.","L.L.C.",
                     "TRUST","TRUSTEE","ESTATE OF",
-                    "HOA","HOMEOWNERS","HOMEOWNER ASSOC",
-                    "CITY OF","COUNTY OF","STATE OF",
-                    "ASSOCIATION","ASSOC ","ASSN ",
+                    "HOA","HOMEOWNERS","HOMEOWNER",
+                    "CITY OF","COUNTY OF","STATE OF","UNITED STATES",
+                    "ASSOCIATION","ASSOC","ASSN",
                     "PROPERTIES","HOLDINGS","INVESTMENTS","VENTURES",
                     "REALTY","DEVELOPMENT","DEVELOPERS",
-                    "PARTNERS","PARTNERSHIP"," GROUP","FUND ",
-                    "CHURCH","SCHOOL DISTRICT","AUTHORITY",
+                    "PARTNERS","PARTNERSHIP","GROUP","FUND",
+                    "CHURCH","SCHOOL","DISTRICT","AUTHORITY","ISD",
                     "BANK","FINANCIAL","MORTGAGE","CAPITAL",
-                    "CROSSING","LIMITED",
+                    "CROSSING","LIMITED","MUSEUM","WATER","UTILITY",
+                    "MANAGEMENT","SERVICES","SOLUTIONS","SYSTEMS",
+                    "ENTERPRISES","CONSTRUCTION","BUILDERS",
                 ]
                 if any(kw in owner_raw for kw in entity_keywords):
                     continue
@@ -273,8 +275,12 @@ def main():
         except ValueError:
             street_num  = 0
             street_name = addr
-        # Sort: Street Name → Street Number → City
-        return (street_name, street_num, city)
+        # Sort: City → Street Name → Street Number
+        return (city, street_name, street_num)
+
+    # Remove rows with no property address before sorting
+    all_rows  = [r for r in all_rows  if r.get("Property Address","").strip()]
+    long_term = [r for r in long_term if r.get("Property Address","").strip()]
 
     all_rows.sort(key=sort_key)
     long_term.sort(key=sort_key)
