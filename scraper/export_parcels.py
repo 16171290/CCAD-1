@@ -179,7 +179,7 @@ def main():
 
         for out in rows:
             # Long-term owner: deed year ≤ 2005
-            deed = out.get("Deed Date","")
+            deed = out.get("Deed Year","")
             try:
                 is_lt = int(str(deed)[:4]) <= 2005
             except:
