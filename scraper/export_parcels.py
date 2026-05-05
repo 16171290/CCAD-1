@@ -204,15 +204,22 @@ def main():
                 addr_lookup[f"{addr} {city}".strip()] = entry
                 addr_lookup[addr] = entry
 
-    # Sort by Property City then Property Address ascending
-    all_rows.sort(key=lambda x: (
-        x.get("Property City","").upper(),
-        x.get("Property Address","").upper()
-    ))
-    long_term.sort(key=lambda x: (
-        x.get("Property City","").upper(),
-        x.get("Property Address","").upper()
-    ))
+    def sort_key(x):
+        city = x.get("Property City","").upper().strip()
+        addr = x.get("Property Address","").upper().strip()
+        # Split address into street number and street name
+        # e.g. "2106 WINTERSTONE DR" → ("WINTERSTONE DR", 2106)
+        parts = addr.split(" ", 1)
+        try:
+            street_num  = int(parts[0])
+            street_name = parts[1] if len(parts) > 1 else ""
+        except ValueError:
+            street_num  = 0
+            street_name = addr
+        return (city, street_name, street_num)
+
+    all_rows.sort(key=sort_key)
+    long_term.sort(key=sort_key)
 
     # Save full export
     out_file = DATA_DIR / f"parcel_export_{today}.csv"
