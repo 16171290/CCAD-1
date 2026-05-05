@@ -207,16 +207,16 @@ def main():
     def sort_key(x):
         city = x.get("Property City","").upper().strip()
         addr = x.get("Property Address","").upper().strip()
-        # Split address into street number and street name
-        # e.g. "2106 WINTERSTONE DR" → ("WINTERSTONE DR", 2106)
+        # Split "123 MAIN ST" into street_num=123, street_name="MAIN ST"
         parts = addr.split(" ", 1)
         try:
             street_num  = int(parts[0])
-            street_name = parts[1] if len(parts) > 1 else ""
+            street_name = parts[1].strip() if len(parts) > 1 else ""
         except ValueError:
             street_num  = 0
             street_name = addr
-        return (city, street_name, street_num)
+        # Sort: Street Name → Street Number → City
+        return (street_name, street_num, city)
 
     all_rows.sort(key=sort_key)
     long_term.sort(key=sort_key)
