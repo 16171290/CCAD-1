@@ -107,14 +107,15 @@ def fetch_zip(session, zip_code):
                         continue
                 except: pass
 
-                # Build clean address from components (not situsconcat which includes city/state/zip)
-                num  = gv(row,"situsbldgnum").strip()
-                st   = gv(row,"situsstreetname").strip()
-                addr = f"{num} {st}".strip()
-                # Fallback to situsconcat but strip everything after the comma
+                # Use situsconcat and strip ", CITY, TX ZIP" suffix
+                # e.g. "5703 ABINGDON DR , RICHARDSON, TX 75082" → "5703 ABINGDON DR"
+                full = gv(row,"situsconcat","situsconcatshort")
+                addr = full.split(",")[0].strip() if full else ""
+                # Fallback to components
                 if not addr:
-                    full = gv(row,"situsconcat","situsconcatshort")
-                    addr = full.split(",")[0].strip()
+                    num  = gv(row,"situsbldgnum").strip()
+                    st   = gv(row,"situsstreetname").strip()
+                    addr = f"{num} {st}".strip()
 
                 sqft = gv(row,"imprvmainarea").replace(",","")
 
