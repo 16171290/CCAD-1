@@ -100,12 +100,21 @@ def fetch_zip(session, zip_code):
                 if pt and pt not in ("real","r","residential"):
                     continue
 
-                # Build address
-                addr = gv(row,"situsconcat","situsconcatshort")
+                # Exclude large commercial buildings — SFR typically under 6,000 sqft
+                sqft_raw = str(row.get("imprvmainarea","") or "").replace(",","").strip()
+                try:
+                    if sqft_raw and float(sqft_raw) > 6000:
+                        continue
+                except: pass
+
+                # Build clean address from components (not situsconcat which includes city/state/zip)
+                num  = gv(row,"situsbldgnum").strip()
+                st   = gv(row,"situsstreetname").strip()
+                addr = f"{num} {st}".strip()
+                # Fallback to situsconcat but strip everything after the comma
                 if not addr:
-                    num = gv(row,"situsbldgnum")
-                    st  = gv(row,"situsstreetname")
-                    addr = f"{num} {st}".strip()
+                    full = gv(row,"situsconcat","situsconcatshort")
+                    addr = full.split(",")[0].strip()
 
                 sqft = gv(row,"imprvmainarea").replace(",","")
 
