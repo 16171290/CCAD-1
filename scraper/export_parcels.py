@@ -207,7 +207,6 @@ def main():
     def sort_key(x):
         city = x.get("Property City","").upper().strip()
         addr = x.get("Property Address","").upper().strip()
-        # Split "123 MAIN ST" into street_num=123, street_name="MAIN ST"
         parts = addr.split(" ", 1)
         try:
             street_num  = int(parts[0])
