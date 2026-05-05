@@ -9,7 +9,7 @@ imprvmainarea, imprvyearbuilt, deedeffdate, proptype, geoid
 currvalmarket, currvalappraised, prevvalmarket, prevvalappraised
 """
 
-import csv, json, logging, sys
+import csv, json, logging, re, sys
 from datetime import datetime
 from pathlib import Path
 import requests
