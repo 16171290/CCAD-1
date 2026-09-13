@@ -1,9 +1,9 @@
 {
-  "fetched_at": "2026-09-12T08:04:45.156065+00:00",
+  "fetched_at": "2026-09-13T08:05:39.265909+00:00",
   "source": "Collin County",
   "date_range": {
-    "start": "2026-09-05",
-    "end": "2026-09-12"
+    "start": "2026-09-06",
+    "end": "2026-09-13"
   },
   "total": 0,
   "with_address": 0,
